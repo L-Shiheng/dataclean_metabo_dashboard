@@ -1,11 +1,13 @@
-# 文件名: data_preprocessing.py
 import pandas as pd
 import numpy as np
 import re
 
 def parse_metdna_file(file_buffer, file_type='csv'):
     """
-    专门解析 MetDNA 导出的特征表
+    解析 MetDNA 导出文件，返回：
+    1. df_transposed: 标准化后的数据表 (行=样本, 列=代谢物)
+    2. feature_meta: 特征元数据表 (包含 Name, Confidence_Level 等，用于过滤和绘图)
+    3. error_message: 错误信息
     """
     # 1. 读取文件
     try:
@@ -14,11 +16,9 @@ def parse_metdna_file(file_buffer, file_type='csv'):
         else:
             df = pd.read_excel(file_buffer)
     except Exception as e:
-        return None, f"读取失败: {str(e)}"
+        return None, None, f"读取失败: {str(e)}"
 
-    # 2. 识别关键列
-    # MetDNA 导出的标准注释列 (我们要排除这些，剩下的就是样本)
-    # 根据您提供的文件，这些是常见的元数据列
+    # 2. 识别元数据列 (MetDNA 标准列)
     metdna_meta_cols = [
         'peak_name', 'mz', 'rt', 'id', 'id_zhulab', 'name', 'formula', 
         'confidence_level', 'smiles', 'inchikey', 'isotope', 'adduct', 
@@ -28,65 +28,76 @@ def parse_metdna_file(file_buffer, file_type='csv'):
         'id_hmdb', 'id_metacyc', 'stereo_isomer_id', 'stereo_isomer_name'
     ]
     
-    # 找出实际存在的元数据列
     existing_meta = [c for c in df.columns if c in metdna_meta_cols]
-    
-    # 剩下的列我们就认为是样本列
     sample_cols = [c for c in df.columns if c not in existing_meta]
     
     if not sample_cols:
-        return None, "未找到样本数据列，请检查文件格式。"
+        return None, None, "未找到样本数据列，请检查文件格式。"
 
-    # 3. 构建代谢物唯一名称 (处理无注释的情况)
-    # 如果有 'name' 列且不为空，用 name；否则用 mz_rt
-    if 'name' in df.columns:
-        # 填充空值
-        df['name'] = df['name'].fillna('')
-        
-        def get_name(row):
-            # 如果名字为空，或者看起来像无意义字符
-            if not row['name'] or str(row['name']).strip() == '':
-                # 使用 m/z 和 RT 作为代号
-                return f"m/z{row['mz']:.4f}_RT{row['rt']:.2f}"
-            return str(row['name']).split(';')[0] # 有些名字有多个分号，取第一个
-            
-        df['Metabolite_ID'] = df.apply(get_name, axis=1)
-    else:
-        # 如果连 name 列都没有
-        df['Metabolite_ID'] = df.apply(lambda row: f"m/z{row['mz']:.4f}_RT{row['rt']:.2f}", axis=1)
+    # 3. 构建唯一 ID 和元数据记录
+    # 确保有 name 列
+    if 'name' not in df.columns:
+        df['name'] = np.nan
+    if 'confidence_level' not in df.columns:
+        df['confidence_level'] = 'Unknown'
 
-    # 确保列名唯一 (防止重名代谢物)
-    df['Metabolite_ID'] = make_unique(df['Metabolite_ID'])
-
-    # 4. 提取数据并转置
-    # 我们只需要 Sample 列，索引变成 Metabolite_ID
-    df_data = df[sample_cols].copy()
-    df_data.index = df['Metabolite_ID']
+    feature_meta_list = []
     
-    # 转置: 行变成样本，列变成代谢物
+    def process_row(row):
+        # 原始名字
+        raw_name = str(row['name']) if pd.notna(row['name']) else ""
+        raw_name = raw_name.strip()
+        
+        # 判断是否被注释 (有名字且不为空)
+        is_annotated = (raw_name != "") and (raw_name.lower() != "nan")
+        
+        # 构建显示用的 ID
+        if is_annotated:
+            # 取第一个分号前的名字
+            clean_name = raw_name.split(';')[0]
+            # 如果有重名，后续处理
+            unique_id = clean_name
+        else:
+            # 无注释，用 m/z 和 RT
+            unique_id = f"m/z{row['mz']:.4f}_RT{row['rt']:.2f}"
+            
+        return {
+            "Metabolite_ID": unique_id,
+            "Original_Name": raw_name,
+            "Confidence_Level": row.get('confidence_level', 'Unknown'),
+            "Is_Annotated": is_annotated
+        }
+
+    # 应用处理
+    meta_info = df.apply(process_row, axis=1)
+    meta_df = pd.DataFrame(meta_info.tolist())
+    
+    # 处理 ID 重名问题 (添加后缀 _1, _2)
+    meta_df['Metabolite_ID'] = make_unique(meta_df['Metabolite_ID'])
+    
+    # 设置索引，方便查找
+    meta_df.set_index('Metabolite_ID', inplace=True)
+    
+    # 4. 构建转置后的数据表
+    df_data = df[sample_cols].copy()
+    df_data.index = meta_df.index # 使用处理后的唯一 ID 作为索引
+    
     df_transposed = df_data.T
     
-    # 5. 自动生成分组列 (Group)
-    # 将索引(样本名)变成一列 SampleID
+    # 5. 自动生成 Group 列
     df_transposed.reset_index(inplace=True)
     df_transposed.rename(columns={'index': 'SampleID'}, inplace=True)
     
-    # 尝试从样本名推断分组 (简单启发式：去掉末尾的数字)
-    # 例如: DK.BT.1208.HT1 -> DK.BT.1208.HT
     def guess_group(s):
-        # 去掉末尾的数字
         s_no_digit = re.sub(r'\d+$', '', str(s))
-        # 去掉末尾可能残留的分隔符
         s_clean = s_no_digit.rstrip('._-')
-        # 如果处理后变成空了(例如样本名叫 "1", "2")，就退回到原名
         return s_clean if s_clean else "Unknown"
 
     df_transposed.insert(1, 'Group', df_transposed['SampleID'].apply(guess_group))
     
-    return df_transposed, None
+    return df_transposed, meta_df, None
 
 def make_unique(series):
-    """解决重名问题，给重复项加后缀 _1, _2"""
     seen = set()
     result = []
     for item in series:
@@ -99,32 +110,27 @@ def make_unique(series):
         result.append(new_item)
     return result
 
-# --- 原有的数据清洗管道 (保持不变) ---
+# --- 原有的清洗管道 (保持不变) ---
 def data_cleaning_pipeline(df, group_col, 
                            missing_thresh=0.5, 
                            impute_method='min', 
                            norm_method='None', 
                            log_transform=True,
                            scale_method='None'):
-    """
-    标准代谢组学数据清洗流程
-    """
-    # 1. 自动识别数值列
+    # 1. 识别
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if group_col in numeric_cols:
-        numeric_cols.remove(group_col)
-    
+    if group_col in numeric_cols: numeric_cols.remove(group_col)
     meta_cols = [c for c in df.columns if c not in numeric_cols]
     
     data_df = df[numeric_cols].copy()
     meta_df = df[meta_cols].copy()
     
-    # 2. 缺失值过滤
+    # 2. 过滤
     missing_ratio = data_df.isnull().mean()
     cols_to_keep = missing_ratio[missing_ratio <= missing_thresh].index
     data_df = data_df[cols_to_keep]
     
-    # 3. 缺失值填充
+    # 3. 填充
     if data_df.isnull().sum().sum() > 0:
         if impute_method == 'min':
             min_vals = data_df.min() * 0.5
@@ -137,7 +143,7 @@ def data_cleaning_pipeline(df, group_col,
             data_df = data_df.fillna(0)
         data_df = data_df.fillna(0)
 
-    # 4. 样本归一化
+    # 4. 归一化
     if norm_method == 'Sum':
         row_sums = data_df.sum(axis=1)
         mean_sum = row_sums.mean()
@@ -147,20 +153,18 @@ def data_cleaning_pipeline(df, group_col,
         mean_median = row_medians.mean()
         data_df = data_df.div(row_medians, axis=0) * mean_median
 
-    # 5. 数据转换
+    # 5. Log
     if log_transform:
-        if (data_df < 0).any().any():
-            pass # 含有负数不Log
-        else:
-            data_df = np.log2(data_df + 1)
+        if (data_df < 0).any().any(): pass 
+        else: data_df = np.log2(data_df + 1)
 
-    # 6. 数据缩放
+    # 6. Scaling
     if scale_method == 'Auto':
         data_df = (data_df - data_df.mean()) / data_df.std()
     elif scale_method == 'Pareto':
         data_df = (data_df - data_df.mean()) / np.sqrt(data_df.std())
 
-    # 7. 清理低方差
+    # 7. 清理
     var_mask = data_df.var() > 1e-9
     data_df = data_df.loc[:, var_mask]
     
