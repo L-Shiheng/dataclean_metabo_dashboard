@@ -55,7 +55,6 @@ def parse_metdna_file(file_buffer, file_type='csv'):
         if is_annotated:
             # 取第一个分号前的名字
             clean_name = raw_name.split(';')[0]
-            # 如果有重名，后续处理
             unique_id = clean_name
         else:
             # 无注释，用 m/z 和 RT
@@ -110,7 +109,7 @@ def make_unique(series):
         result.append(new_item)
     return result
 
-# --- 原有的清洗管道 (保持不变) ---
+# --- 原有的清洗管道 ---
 def data_cleaning_pipeline(df, group_col, 
                            missing_thresh=0.5, 
                            impute_method='min', 
