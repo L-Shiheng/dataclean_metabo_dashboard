@@ -7,7 +7,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import seaborn as sns
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+# 移除了 mpatches，不再需要手动画图例
 from sklearn.decomposition import PCA
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.preprocessing import StandardScaler
@@ -86,19 +86,13 @@ def calculate_vips(model):
 
 @st.cache_data
 def run_pairwise_statistics(df, group_col, case, control, features, equal_var=False):
-    """
-    equal_var=True: Student's t-test (MetaboAnalyst 默认)
-    equal_var=False: Welch's t-test (更严谨)
-    """
     g1 = df[df[group_col] == case]
     g2 = df[df[group_col] == control]
     res = []
     for f in features:
         v1, v2 = g1[f].values, g2[f].values
         fc = np.mean(v1) - np.mean(v2) 
-        try: 
-            # 这里的 equal_var 参数决定了是 Student 还是 Welch
-            t, p = stats.ttest_ind(v1, v2, equal_var=equal_var)
+        try: t, p = stats.ttest_ind(v1, v2, equal_var=equal_var)
         except: p = 1.0
         if np.isnan(p): p = 1.0
         res.append({'Metabolite': f, 'Log2_FC': fc, 'P_Value': p})
@@ -116,7 +110,6 @@ def run_pairwise_statistics(df, group_col, case, control, features, equal_var=Fa
 # ==========================================
 with st.sidebar:
     st.header("🛠️ 分析控制台")
-    
     uploaded_files = st.file_uploader("1. 上传 MetDNA 数据 (支持多文件)", type=["csv", "xlsx"], accept_multiple_files=True)
     feature_meta = None; raw_df = None
 
@@ -173,7 +166,7 @@ with st.sidebar:
             impute_m = st.selectbox("填充方法", ["min", "mean", "zero"], index=0)
             norm_m = st.selectbox("样本归一化", ["None", "Sum", "Median"], index=0)
             do_log = st.checkbox("Log2 转化", value=True)
-            scale_m = st.selectbox("特征缩放", ["None", "Auto", "Pareto"], index=2) # 默认 Pareto
+            scale_m = st.selectbox("特征缩放", ["None", "Auto", "Pareto"], index=2)
 
         current_groups = sorted(raw_df[group_col].astype(str).unique())
         st.markdown("### 5. 组别与对比")
@@ -189,9 +182,7 @@ with st.sidebar:
         p_th = c3.number_input("P-value", 0.05, format="%.3f")
         fc_th = c4.number_input("Log2 FC", 1.0)
         
-        # 关键修改：T检验类型
-        use_equal_var = st.checkbox("假设方差相等 (Student's t-test)", value=True, 
-                                    help="勾选即为 Student's t-test (MetaboAnalyst 默认)；不勾选为 Welch's t-test (更严谨)。")
+        use_equal_var = st.checkbox("假设方差相等 (Student's t-test)", value=True, help="与 MetaboAnalyst 默认一致")
         enable_jitter = st.checkbox("火山图抖动", value=True)
         
         st.markdown("---")
@@ -222,7 +213,7 @@ with st.spinner("正在计算中..."):
 
     df_sub = df_proc[df_proc[group_col].isin(selected_groups)].copy()
 
-    # 差异统计 (传入 equal_var 参数)
+    # 差异统计
     if case_grp != ctrl_grp:
         res_stats = run_pairwise_statistics(df_sub, group_col, case_grp, ctrl_grp, feats, equal_var=use_equal_var)
         if feature_meta is not None:
@@ -252,7 +243,6 @@ with tabs[0]:
     with c2:
         if len(df_sub) < 3: st.warning("样本不足")
         else:
-            # PCA 通常还是看 Standardized 的分布，即使选择了 Pareto
             X = StandardScaler().fit_transform(df_sub[feats])
             pca = PCA(n_components=2).fit(X)
             pcs = pca.transform(X)
@@ -269,8 +259,6 @@ with tabs[1]:
     with c2:
         if len(df_sub) < 3: st.warning("样本不足")
         else:
-            # 修正：直接使用经过 data_cleaning_pipeline 处理过的数据 (已按用户要求做过 Pareto/Auto Scaling)
-            # 这样 VIP 结果才会和 MetaboAnalyst 一致
             X_pls = df_sub[feats].values
             y_labels = pd.factorize(df_sub[group_col])[0]
             pls_model = PLSRegression(n_components=2).fit(X_pls, y_labels)
@@ -341,56 +329,43 @@ with tabs[3]:
             update_layout_square(fig_vol, f"Volcano: {case_grp} vs {ctrl_grp}", "Log2 Fold Change", "-Log10(P-value)")
             st.plotly_chart(fig_vol, use_container_width=False)
 
-# --- Tab 5: 热图 (重写版) ---
+# --- Tab 5: 热图 (美化修复版) ---
 with tabs[4]:
     if not sig_metabolites: st.info("无显著差异物")
     else:
         c1, c2, c3 = st.columns([1, 6, 1])
         with c2:
             top_n = 50
-            # 排序：P值最小的在前
             top_feats = res_stats.sort_values('P_Value').head(top_n)['Metabolite'].tolist()
-            
-            # 数据准备：样本=行，代谢物=列 -> 转置为 -> 行=代谢物，列=样本
-            # 这样符合 MetaboAnalyst 风格 (Tall heatmaps)
+            # 转置：列=样本，行=代谢物
             hm_data = df_sub.set_index(group_col)[top_feats].T 
             
-            # 构建列颜色 (Column Colors, 对应样本分组)
-            # 获取样本对应的组别
+            # 列颜色 (样本分组)
             sample_groups = df_sub[group_col]
             unique_grps = sample_groups.unique()
             lut = {grp: GROUP_COLORS[i % len(GROUP_COLORS)] for i, grp in enumerate(unique_grps)}
-            col_colors = sample_groups.map(lut) # Pandas Series
+            col_colors = sample_groups.map(lut)
             
-            # 使用 Clean Name 作为行标签
+            # 使用 Clean Name
             if feature_meta is not None:
                 row_labels = [feature_meta.loc[f, 'Clean_Name'] if f in feature_meta.index else f for f in hm_data.index]
-                hm_data.index = row_labels # 临时改名用于绘图
+                hm_data.index = row_labels
 
             try:
-                # 绘图：注意 col_colors 对应列(样本)
                 g = sns.clustermap(hm_data.astype(float), 
-                                   z_score=0, # 对行(代谢物)进行 Z-score 标准化
+                                   z_score=0, # 行(代谢物) Z-score
                                    cmap="vlag", center=0, 
-                                   col_colors=col_colors, # 顶部显示组别颜色条
-                                   figsize=(12, 14), # 长图
+                                   col_colors=col_colors, 
+                                   figsize=(12, 14), 
                                    dendrogram_ratio=(.1, .1), 
-                                   cbar_pos=(.02, .8, .03, .15) # 图例在左上角
+                                   # 颜色条放置在顶部中央，水平方向
+                                   cbar_pos=(0.35, 0.96, 0.3, 0.02), cbar_kws={'orientation': 'horizontal', 'label': 'Z-Score'}
                                   )
-                
-                # 标签设置
-                # X轴: 样本名 (旋转90度)
                 g.ax_heatmap.set_xticklabels(g.ax_heatmap.get_xmajorticklabels(), rotation=90, fontsize=9)
-                # Y轴: 代谢物名 (水平)
                 g.ax_heatmap.set_yticklabels(g.ax_heatmap.get_ymajorticklabels(), rotation=0, fontsize=10)
+                # 清除坐标轴标题，防止"Group"覆盖文字
                 g.ax_heatmap.set_ylabel("")
                 g.ax_heatmap.set_xlabel("")
-
-                # --- 关键：手动添加分组图例 ---
-                handles = [mpatches.Patch(facecolor=lut[name], edgecolor='black', label=name) for name in lut]
-                # 将图例放在左侧空白处
-                g.ax_row_dendrogram.legend(handles=handles, title="Group", loc='upper left', bbox_to_anchor=(-1.5, 1))
-
                 st.pyplot(g.fig)
             except Exception as e: st.error(f"绘图错误: {e}")
 
