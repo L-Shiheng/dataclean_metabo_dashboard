@@ -7,6 +7,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import seaborn as sns
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from sklearn.decomposition import PCA
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.preprocessing import StandardScaler
@@ -34,9 +35,6 @@ st.markdown("""
         font-size: 16px; font-weight: bold; padding: 10px 15px;
         background-color: white; border-radius: 5px 5px 0 0;
     }
-    .stMultiSelect [data-baseweb="tag"] {background-color: #e3e8ee;}
-    
-    /* 调整提交按钮样式 */
     div[data-testid="stForm"] button {
         width: 100%; background-color: #ff4b4b; color: white; font-weight: bold; border: none; padding: 0.5rem;
     }
@@ -87,14 +85,20 @@ def calculate_vips(model):
     return vips
 
 @st.cache_data
-def run_pairwise_statistics(df, group_col, case, control, features):
+def run_pairwise_statistics(df, group_col, case, control, features, equal_var=False):
+    """
+    equal_var=True: Student's t-test (MetaboAnalyst 默认)
+    equal_var=False: Welch's t-test (更严谨)
+    """
     g1 = df[df[group_col] == case]
     g2 = df[df[group_col] == control]
     res = []
     for f in features:
         v1, v2 = g1[f].values, g2[f].values
         fc = np.mean(v1) - np.mean(v2) 
-        try: t, p = stats.ttest_ind(v1, v2, equal_var=False)
+        try: 
+            # 这里的 equal_var 参数决定了是 Student 还是 Welch
+            t, p = stats.ttest_ind(v1, v2, equal_var=equal_var)
         except: p = 1.0
         if np.isnan(p): p = 1.0
         res.append({'Metabolite': f, 'Log2_FC': fc, 'P_Value': p})
@@ -108,22 +112,17 @@ def run_pairwise_statistics(df, group_col, case, control, features):
     return res_df
 
 # ==========================================
-# 2. 侧边栏与数据加载 (Part A: 实时交互区)
+# 2. 侧边栏与数据加载
 # ==========================================
 with st.sidebar:
     st.header("🛠️ 分析控制台")
     
-    # --- 文件上传区 ---
     uploaded_files = st.file_uploader("1. 上传 MetDNA 数据 (支持多文件)", type=["csv", "xlsx"], accept_multiple_files=True)
-    
-    feature_meta = None 
-    raw_df = None
+    feature_meta = None; raw_df = None
 
     if not uploaded_files:
-        st.info("👋 请先上传数据文件")
-        st.stop()
+        st.info("👋 请先上传数据文件"); st.stop()
         
-    # 解析文件
     parsed_results = []
     for i, file in enumerate(uploaded_files):
         try:
@@ -131,48 +130,34 @@ with st.sidebar:
             file_type = 'csv' if file.name.endswith('.csv') else 'excel'
             unique_name = f"{os.path.splitext(file.name)[0]}_{i+1}{os.path.splitext(file.name)[1]}"
             df_t, meta, err = parse_metdna_file(file, unique_name, file_type=file_type)
-            if err:
-                st.warning(f"文件 {file.name} 解析失败: {err}"); continue
+            if err: st.warning(f"文件 {file.name} 解析失败: {err}"); continue
             parsed_results.append((df_t, meta, unique_name))
-        except Exception as e:
-            st.error(f"处理文件 {file.name} 时出错: {e}")
+        except Exception as e: st.error(f"出错: {e}")
     
     if not parsed_results: st.stop()
         
     if len(parsed_results) == 1:
-        raw_df = parsed_results[0][0]
-        feature_meta = parsed_results[0][1]
-        st.success(f"✅ 已加载: {parsed_results[0][2]}")
+        raw_df = parsed_results[0][0]; feature_meta = parsed_results[0][1]
+        st.success(f"✅ 加载成功")
     else:
         merged_df, merged_meta, m_err = merge_multiple_dfs(parsed_results)
         if m_err: st.error(m_err); st.stop()
-        raw_df = merged_df
-        feature_meta = merged_meta
-        st.success(f"✅ 已合并 {len(parsed_results)} 个文件")
+        raw_df = merged_df; feature_meta = merged_meta
+        st.success(f"✅ 合并成功")
 
-    # 样本信息表上传
     sample_info_file = st.file_uploader("2. 上传样本信息表 (可选)", type=["csv", "xlsx"])
     if sample_info_file:
         raw_df, msg = apply_sample_info(raw_df, sample_info_file)
         if "成功" in msg: st.success(msg)
         else: st.warning(msg)
 
-    # --- 新增：导出合并后的表格 ---
     if raw_df is not None:
         csv_data = raw_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 下载合并数据 (CSV)",
-            data=csv_data,
-            file_name="merged_metabolomics_data.csv",
-            mime="text/csv",
-            help="导出已合并并对齐分组的数据表，可直接用于 MetaboAnalyst。"
-        )
+        st.download_button("📥 下载合并数据 (CSV)", csv_data, "merged_data.csv", "text/csv")
 
     st.divider()
     
-    # ==========================================
-    # 3. 参数设置表单 (Part B: 批量提交区)
-    # ==========================================
+    # --- 参数表单 ---
     with st.form(key='analysis_form'):
         st.markdown("### ⚙️ 参数设置")
         
@@ -182,15 +167,15 @@ with st.sidebar:
         
         filter_option = st.radio("4. 特征过滤:", ["全部特征", "仅已注释特征"], index=0)
         
-        with st.expander("数据清洗与标准化 (高级)", expanded=False):
+        with st.expander("数据清洗 (影响 PCA/PLS-DA)", expanded=False):
+            st.markdown("MetaboAnalyst 常用设置：Pareto Scaling")
             miss_th = st.slider("剔除缺失率 > X", 0.0, 1.0, 0.5, 0.1)
             impute_m = st.selectbox("填充方法", ["min", "mean", "zero"], index=0)
             norm_m = st.selectbox("样本归一化", ["None", "Sum", "Median"], index=0)
             do_log = st.checkbox("Log2 转化", value=True)
-            scale_m = st.selectbox("特征缩放", ["None", "Auto", "Pareto"], index=0)
+            scale_m = st.selectbox("特征缩放", ["None", "Auto", "Pareto"], index=2) # 默认 Pareto
 
         current_groups = sorted(raw_df[group_col].astype(str).unique())
-        
         st.markdown("### 5. 组别与对比")
         selected_groups = st.multiselect("纳入分析的组:", current_groups, default=current_groups[:2] if len(current_groups)>=2 else current_groups)
         
@@ -199,25 +184,30 @@ with st.sidebar:
         case_grp = c1.selectbox("Exp (Case)", valid_grps_list, index=0 if valid_grps_list else None)
         ctrl_grp = c2.selectbox("Ctrl (Ref)", valid_grps_list, index=1 if len(valid_grps_list)>1 else 0)
         
-        st.markdown("### 6. 绘图阈值")
+        st.markdown("### 6. 统计设置")
         c3, c4 = st.columns(2)
         p_th = c3.number_input("P-value", 0.05, format="%.3f")
         fc_th = c4.number_input("Log2 FC", 1.0)
+        
+        # 关键修改：T检验类型
+        use_equal_var = st.checkbox("假设方差相等 (Student's t-test)", value=True, 
+                                    help="勾选即为 Student's t-test (MetaboAnalyst 默认)；不勾选为 Welch's t-test (更严谨)。")
         enable_jitter = st.checkbox("火山图抖动", value=True)
         
         st.markdown("---")
         submit_button = st.form_submit_button(label='🚀 开始分析 (Run Analysis)')
 
 # ==========================================
-# 4. 主逻辑 (仅在点击提交或首次加载时运行)
+# 4. 主逻辑
 # ==========================================
 
 if len(selected_groups) < 2:
-    if submit_button: st.error("请至少选择 2 个组进行分析！")
-    else: st.info("👈 请在左侧设置参数并点击 '开始分析'")
+    if submit_button: st.error("请至少选择 2 个组！")
+    else: st.info("👈 请设置参数并点击 '开始分析'")
     st.stop()
 
 with st.spinner("正在计算中..."):
+    # 清洗数据
     df_proc, feats = data_cleaning_pipeline(
         raw_df, group_col, missing_thresh=miss_th, impute_method=impute_m, 
         norm_method=norm_m, log_transform=do_log, scale_method=scale_m
@@ -228,19 +218,18 @@ with st.spinner("正在计算中..."):
             annotated_feats = feature_meta[feature_meta['Is_Annotated'] == True].index.tolist()
             feats = [f for f in feats if f in annotated_feats]
             if not feats: st.error("过滤后无特征！"); st.stop()
-        else:
-            st.warning("非 MetDNA 数据，无法过滤注释。")
+        else: st.warning("非 MetDNA 数据，无法过滤。")
 
     df_sub = df_proc[df_proc[group_col].isin(selected_groups)].copy()
 
+    # 差异统计 (传入 equal_var 参数)
     if case_grp != ctrl_grp:
-        res_stats = run_pairwise_statistics(df_sub, group_col, case_grp, ctrl_grp, feats)
+        res_stats = run_pairwise_statistics(df_sub, group_col, case_grp, ctrl_grp, feats, equal_var=use_equal_var)
         if feature_meta is not None:
             res_stats = res_stats.merge(feature_meta[['Confidence_Level', 'Clean_Name']], 
                                         left_on='Metabolite', right_index=True, how='left')
             res_stats['Confidence_Level'] = res_stats['Confidence_Level'].fillna('Unknown')
-        else:
-            res_stats['Confidence_Level'] = 'N/A'
+        else: res_stats['Confidence_Level'] = 'N/A'
         
         res_stats['Sig'] = 'NS'
         res_stats.loc[(res_stats['P_Value'] < p_th) & (res_stats['Log2_FC'] > fc_th), 'Sig'] = 'Up'
@@ -253,9 +242,9 @@ with st.spinner("正在计算中..."):
 # 5. 结果展示
 # ==========================================
 st.title("📊 代谢组学分析报告")
-st.caption(f"对比: {case_grp} vs {ctrl_grp} | 分析特征数: {len(feats)} | 显著差异: {len(sig_metabolites)} 个")
+st.caption(f"对比: {case_grp} vs {ctrl_grp} | 特征数: {len(feats)} | 缩放: {scale_m} | T检验: {'Student' if use_equal_var else 'Welch'}")
 
-tabs = st.tabs(["📊 PCA", "🎯 PLS-DA", "⭐ VIP 特征", "🌋 火山图", "🔥 热图", "📑 详情"])
+tabs = st.tabs(["📊 PCA", "🎯 PLS-DA", "⭐ VIP 特征", "🌋 火山图", "🔥 热图 (美化版)", "📑 详情"])
 
 # --- Tab 1: PCA ---
 with tabs[0]:
@@ -263,6 +252,7 @@ with tabs[0]:
     with c2:
         if len(df_sub) < 3: st.warning("样本不足")
         else:
+            # PCA 通常还是看 Standardized 的分布，即使选择了 Pareto
             X = StandardScaler().fit_transform(df_sub[feats])
             pca = PCA(n_components=2).fit(X)
             pcs = pca.transform(X)
@@ -279,7 +269,9 @@ with tabs[1]:
     with c2:
         if len(df_sub) < 3: st.warning("样本不足")
         else:
-            X_pls = StandardScaler().fit_transform(df_sub[feats])
+            # 修正：直接使用经过 data_cleaning_pipeline 处理过的数据 (已按用户要求做过 Pareto/Auto Scaling)
+            # 这样 VIP 结果才会和 MetaboAnalyst 一致
+            X_pls = df_sub[feats].values
             y_labels = pd.factorize(df_sub[group_col])[0]
             pls_model = PLSRegression(n_components=2).fit(X_pls, y_labels)
             pls_scores = pls_model.x_scores_
@@ -306,9 +298,9 @@ with tabs[2]:
         if feature_meta is not None:
              vip_df = vip_df.merge(feature_meta[['Clean_Name']], left_on='Metabolite', right_index=True, how='left')
              vip_df['Display_Name'] = vip_df['Clean_Name'].fillna(vip_df['Metabolite'])
-        else:
-             vip_df['Display_Name'] = vip_df['Metabolite']
+        else: vip_df['Display_Name'] = vip_df['Metabolite']
         top_vip = vip_df.sort_values('VIP', ascending=True).tail(25)
+        
         c1, c2, c3 = st.columns([1, 6, 1])
         with c2:
             fig_vip = px.bar(top_vip, x="VIP", y="Display_Name", orientation='h',
@@ -317,11 +309,10 @@ with tabs[2]:
             fig_vip.update_traces(marker_line_color='black', marker_line_width=1.0)
             fig_vip.update_layout(
                 template="simple_white", width=800, height=700,
-                title={'text': "VIP Scores (PLS-DA)", 'x':0.5, 'xanchor': 'center', 'font': dict(size=20, family="Arial, bold")},
+                title={'text': "VIP Scores", 'x':0.5, 'xanchor': 'center', 'font': dict(size=20, family="Arial, bold")},
                 xaxis=dict(title="VIP Score", showline=True, mirror=True, linewidth=2, linecolor='black'),
                 yaxis=dict(title="", showline=True, mirror=True, linewidth=2, linecolor='black'),
-                coloraxis_showscale=False,
-                margin=dict(l=200, r=40, t=60, b=60) 
+                coloraxis_showscale=False, margin=dict(l=200, r=40, t=60, b=60) 
             )
             st.plotly_chart(fig_vip, use_container_width=False)
 
@@ -340,8 +331,7 @@ with tabs[3]:
                 plot_df['-Log10_P_J'] = plot_df[y_c] + np.random.normal(0, yr*0.015, len(plot_df))
                 x_c, y_c = "Log2_FC_J", "-Log10_P_J"
             
-            hover_dict = {"Metabolite":True, "Log2_FC":':.2f', "P_Value":':.2e', 
-                          "Confidence_Level":True, x_c:False, y_c:False}
+            hover_dict = {"Metabolite":True, "Log2_FC":':.2f', "P_Value":':.2e', "Confidence_Level":True, x_c:False, y_c:False}
             fig_vol = px.scatter(plot_df, x=x_c, y=y_c, color="Sig", color_discrete_map=COLOR_PALETTE,
                                  hover_data=hover_dict, width=600, height=600)
             fig_vol.add_hline(y=-np.log10(p_th), line_dash="dash", line_color="black", opacity=0.8)
@@ -351,43 +341,71 @@ with tabs[3]:
             update_layout_square(fig_vol, f"Volcano: {case_grp} vs {ctrl_grp}", "Log2 Fold Change", "-Log10(P-value)")
             st.plotly_chart(fig_vol, use_container_width=False)
 
-# --- Tab 5: 热图 ---
+# --- Tab 5: 热图 (重写版) ---
 with tabs[4]:
     if not sig_metabolites: st.info("无显著差异物")
     else:
         c1, c2, c3 = st.columns([1, 6, 1])
         with c2:
             top_n = 50
+            # 排序：P值最小的在前
             top_feats = res_stats.sort_values('P_Value').head(top_n)['Metabolite'].tolist()
-            hm_data = df_sub.set_index(group_col)[top_feats]
-            lut = {grp: GROUP_COLORS[i % len(GROUP_COLORS)] for i, grp in enumerate(df_sub[group_col].unique())}
-            row_colors = df_sub[group_col].map(lut)
+            
+            # 数据准备：样本=行，代谢物=列 -> 转置为 -> 行=代谢物，列=样本
+            # 这样符合 MetaboAnalyst 风格 (Tall heatmaps)
+            hm_data = df_sub.set_index(group_col)[top_feats].T 
+            
+            # 构建列颜色 (Column Colors, 对应样本分组)
+            # 获取样本对应的组别
+            sample_groups = df_sub[group_col]
+            unique_grps = sample_groups.unique()
+            lut = {grp: GROUP_COLORS[i % len(GROUP_COLORS)] for i, grp in enumerate(unique_grps)}
+            col_colors = sample_groups.map(lut) # Pandas Series
+            
+            # 使用 Clean Name 作为行标签
+            if feature_meta is not None:
+                row_labels = [feature_meta.loc[f, 'Clean_Name'] if f in feature_meta.index else f for f in hm_data.index]
+                hm_data.index = row_labels # 临时改名用于绘图
+
             try:
-                g = sns.clustermap(hm_data.astype(float), z_score=1, cmap="vlag", center=0, 
-                                   row_colors=row_colors, figsize=(12, 12), 
-                                   dendrogram_ratio=(.15, .15), 
-                                   cbar_pos=(0.3, 1.02, 0.4, 0.03), cbar_kws={'orientation': 'horizontal'})
-                g.ax_heatmap.set_xticklabels(g.ax_heatmap.get_xmajorticklabels(), rotation=45, ha="right", fontsize=10)
-                g.ax_heatmap.set_yticklabels([]); g.ax_heatmap.set_ylabel("Samples", fontsize=12)
+                # 绘图：注意 col_colors 对应列(样本)
+                g = sns.clustermap(hm_data.astype(float), 
+                                   z_score=0, # 对行(代谢物)进行 Z-score 标准化
+                                   cmap="vlag", center=0, 
+                                   col_colors=col_colors, # 顶部显示组别颜色条
+                                   figsize=(12, 14), # 长图
+                                   dendrogram_ratio=(.1, .1), 
+                                   cbar_pos=(.02, .8, .03, .15) # 图例在左上角
+                                  )
+                
+                # 标签设置
+                # X轴: 样本名 (旋转90度)
+                g.ax_heatmap.set_xticklabels(g.ax_heatmap.get_xmajorticklabels(), rotation=90, fontsize=9)
+                # Y轴: 代谢物名 (水平)
+                g.ax_heatmap.set_yticklabels(g.ax_heatmap.get_ymajorticklabels(), rotation=0, fontsize=10)
+                g.ax_heatmap.set_ylabel("")
+                g.ax_heatmap.set_xlabel("")
+
+                # --- 关键：手动添加分组图例 ---
+                handles = [mpatches.Patch(facecolor=lut[name], edgecolor='black', label=name) for name in lut]
+                # 将图例放在左侧空白处
+                g.ax_row_dendrogram.legend(handles=handles, title="Group", loc='upper left', bbox_to_anchor=(-1.5, 1))
+
                 st.pyplot(g.fig)
             except Exception as e: st.error(f"绘图错误: {e}")
 
-# --- Tab 6: 详情 & 箱线图 ---
+# --- Tab 6: 详情 ---
 with tabs[5]:
     c1, c2 = st.columns([1.5, 1])
     with c1:
         st.subheader("统计表")
         if not res_stats.empty:
             display_df = res_stats.sort_values("P_Value").copy()
-            if 'Clean_Name' in display_df.columns:
-                 display_df['Name'] = display_df['Clean_Name'].fillna(display_df['Metabolite'])
-            else:
-                 display_df['Name'] = display_df['Metabolite']
+            if 'Clean_Name' in display_df.columns: display_df['Name'] = display_df['Clean_Name'].fillna(display_df['Metabolite'])
+            else: display_df['Name'] = display_df['Metabolite']
             cols = ["Name", "Log2_FC", "P_Value", "FDR", "Confidence_Level"]
-            cols = [c for c in cols if c in display_df.columns]
-            st.dataframe(display_df[cols].style.format({"Log2_FC": "{:.2f}", "P_Value": "{:.2e}", "FDR": "{:.2e}"})
-                         .background_gradient(subset=['P_Value'], cmap="Reds_r", vmin=0, vmax=0.05),
-                         use_container_width=True, height=600)
+            st.dataframe(display_df[[c for c in cols if c in display_df]].style.format({"Log2_FC": "{:.2f}", "P_Value": "{:.2e}", "FDR": "{:.2e}"})
+                         .background_gradient(subset=['P_Value'], cmap="Reds_r", vmin=0, vmax=0.05), use_container_width=True, height=600)
     with c2:
         st.subheader("箱线图")
         feat_options = sorted(feats)
