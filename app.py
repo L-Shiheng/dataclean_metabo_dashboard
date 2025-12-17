@@ -38,12 +38,7 @@ st.markdown("""
     
     /* 调整提交按钮样式 */
     div[data-testid="stForm"] button {
-        width: 100%;
-        background-color: #ff4b4b;
-        color: white;
-        font-weight: bold;
-        border: none;
-        padding: 0.5rem;
+        width: 100%; background-color: #ff4b4b; color: white; font-weight: bold; border: none; padding: 0.5rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -118,7 +113,7 @@ def run_pairwise_statistics(df, group_col, case, control, features):
 with st.sidebar:
     st.header("🛠️ 分析控制台")
     
-    # --- 文件上传区 (必须实时响应，不能放在Form里) ---
+    # --- 文件上传区 ---
     uploaded_files = st.file_uploader("1. 上传 MetDNA 数据 (支持多文件)", type=["csv", "xlsx"], accept_multiple_files=True)
     
     feature_meta = None 
@@ -155,12 +150,23 @@ with st.sidebar:
         feature_meta = merged_meta
         st.success(f"✅ 已合并 {len(parsed_results)} 个文件")
 
-    # 样本信息表上传 (实时)
+    # 样本信息表上传
     sample_info_file = st.file_uploader("2. 上传样本信息表 (可选)", type=["csv", "xlsx"])
     if sample_info_file:
         raw_df, msg = apply_sample_info(raw_df, sample_info_file)
         if "成功" in msg: st.success(msg)
         else: st.warning(msg)
+
+    # --- 新增：导出合并后的表格 ---
+    if raw_df is not None:
+        csv_data = raw_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 下载合并数据 (CSV)",
+            data=csv_data,
+            file_name="merged_metabolomics_data.csv",
+            mime="text/csv",
+            help="导出已合并并对齐分组的数据表，可直接用于 MetaboAnalyst。"
+        )
 
     st.divider()
     
@@ -170,15 +176,12 @@ with st.sidebar:
     with st.form(key='analysis_form'):
         st.markdown("### ⚙️ 参数设置")
         
-        # 分组列选择
         non_num = raw_df.select_dtypes(exclude=[np.number]).columns.tolist()
         default_grp_idx = non_num.index('Group') if 'Group' in non_num else 0
         group_col = st.selectbox("3. 分组列", non_num, index=default_grp_idx)
         
-        # 特征过滤
         filter_option = st.radio("4. 特征过滤:", ["全部特征", "仅已注释特征"], index=0)
         
-        # 数据清洗折叠栏
         with st.expander("数据清洗与标准化 (高级)", expanded=False):
             miss_th = st.slider("剔除缺失率 > X", 0.0, 1.0, 0.5, 0.1)
             impute_m = st.selectbox("填充方法", ["min", "mean", "zero"], index=0)
@@ -186,20 +189,12 @@ with st.sidebar:
             do_log = st.checkbox("Log2 转化", value=True)
             scale_m = st.selectbox("特征缩放", ["None", "Auto", "Pareto"], index=0)
 
-        # 组别选择 (需要根据 group_col 动态获取，但 Form 内无法实时更新 group_col 的变化)
-        # 技巧：Form 提交后会刷新，所以这里只能显示基于*上一次*运行有效的组
-        # 第一次运行时 group_col 是默认值
-        
-        # 为了用户体验，我们先获取当前 raw_df 的组别
-        # 注意：如果用户改了 group_col 但没点提交，这里的 all_groups 还是旧的。
-        # 这是 Streamlit Form 的限制，但在实际操作中影响不大。
         current_groups = sorted(raw_df[group_col].astype(str).unique())
         
         st.markdown("### 5. 组别与对比")
         selected_groups = st.multiselect("纳入分析的组:", current_groups, default=current_groups[:2] if len(current_groups)>=2 else current_groups)
         
         c1, c2 = st.columns(2)
-        # 简单的防错：确保 default index 不越界
         valid_grps_list = list(selected_groups)
         case_grp = c1.selectbox("Exp (Case)", valid_grps_list, index=0 if valid_grps_list else None)
         ctrl_grp = c2.selectbox("Ctrl (Ref)", valid_grps_list, index=1 if len(valid_grps_list)>1 else 0)
@@ -211,20 +206,17 @@ with st.sidebar:
         enable_jitter = st.checkbox("火山图抖动", value=True)
         
         st.markdown("---")
-        # --- 提交按钮 ---
         submit_button = st.form_submit_button(label='🚀 开始分析 (Run Analysis)')
 
 # ==========================================
 # 4. 主逻辑 (仅在点击提交或首次加载时运行)
 # ==========================================
 
-# 如果没有组，停止
 if len(selected_groups) < 2:
     if submit_button: st.error("请至少选择 2 个组进行分析！")
     else: st.info("👈 请在左侧设置参数并点击 '开始分析'")
     st.stop()
 
-# 数据处理 Pipeline
 with st.spinner("正在计算中..."):
     df_proc, feats = data_cleaning_pipeline(
         raw_df, group_col, missing_thresh=miss_th, impute_method=impute_m, 
@@ -258,7 +250,7 @@ with st.spinner("正在计算中..."):
         res_stats = pd.DataFrame(); sig_metabolites = []
 
 # ==========================================
-# 5. 结果展示 (Tab页)
+# 5. 结果展示
 # ==========================================
 st.title("📊 代谢组学分析报告")
 st.caption(f"对比: {case_grp} vs {ctrl_grp} | 分析特征数: {len(feats)} | 显著差异: {len(sig_metabolites)} 个")
