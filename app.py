@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import os
 from scipy import stats
 import plotly.express as px
 import plotly.graph_objects as go
@@ -15,9 +16,9 @@ from statsmodels.stats.multitest import multipletests
 # 0. 导入数据清洗模块
 # ==========================================
 try:
-    from data_preprocessing import data_cleaning_pipeline, parse_metdna_file, merge_multiple_dfs
+    from data_preprocessing import data_cleaning_pipeline, parse_metdna_file, merge_multiple_dfs, apply_sample_info
 except ImportError:
-    st.error("❌ 严重错误：未找到 'data_preprocessing.py'。请确保该文件在同一目录下。")
+    st.error("❌ 严重错误：未找到 'data_preprocessing.py'。")
     st.stop()
 
 # ==========================================
@@ -43,12 +44,8 @@ GROUP_COLORS = ['#E64B35', '#4DBBD5', '#00A087', '#3C5488', '#F39B7F', '#8491B4'
 # --- 通用绘图布局 ---
 def update_layout_square(fig, title="", x_title="", y_title="", width=600, height=600):
     fig.update_layout(
-        template="simple_white",
-        width=width, height=height,
-        title={
-            'text': title, 'y':0.95, 'x':0.5, 'xanchor': 'center', 'yanchor': 'top',
-            'font': dict(size=20, color='black', family="Arial, bold")
-        },
+        template="simple_white", width=width, height=height,
+        title={'text': title, 'y':0.95, 'x':0.5, 'xanchor': 'center', 'yanchor': 'top', 'font': dict(size=20, color='black', family="Arial, bold")},
         xaxis=dict(title=x_title, showline=True, linewidth=2, linecolor='black', mirror=True, title_font=dict(size=16, family="Arial, bold")),
         yaxis=dict(title=y_title, showline=True, linewidth=2, linecolor='black', mirror=True, title_font=dict(size=16, family="Arial, bold"), automargin=True),
         legend=dict(yanchor="top", y=1, xanchor="left", x=1.15, bordercolor="Black", borderwidth=0, font=dict(size=12)),
@@ -110,64 +107,67 @@ def run_pairwise_statistics(df, group_col, case, control, features):
 # ==========================================
 with st.sidebar:
     st.header("🛠️ 分析控制台")
-    # 关键修改：允许上传多个文件
-    uploaded_files = st.file_uploader("1. 上传数据 (支持多文件合并)", type=["csv", "xlsx"], accept_multiple_files=True)
+    
+    # 1. 数据上传
+    uploaded_files = st.file_uploader("1. 上传 MetDNA 数据 (支持多文件)", type=["csv", "xlsx"], accept_multiple_files=True)
     
     feature_meta = None 
     raw_df = None
 
     if not uploaded_files:
-        st.info("👋 请上传一个或多个 MetDNA 导出文件")
+        st.info("👋 请先上传数据文件")
         st.stop()
         
     # --- 批量文件解析与合并 ---
     parsed_results = []
-    
-    for file in uploaded_files:
+    for i, file in enumerate(uploaded_files):
         try:
-            file.seek(0) # 重置指针
+            file.seek(0)
             file_type = 'csv' if file.name.endswith('.csv') else 'excel'
-            # 检查是不是 MetDNA 格式 (简单检查)
-            # 这里默认多文件上传就是为了合并 MetDNA 数据
-            df_t, meta, err = parse_metdna_file(file, file.name, file_type=file_type)
+            # 自动编号防止重名
+            unique_name = f"{os.path.splitext(file.name)[0]}_{i+1}{os.path.splitext(file.name)[1]}"
+            df_t, meta, err = parse_metdna_file(file, unique_name, file_type=file_type)
             
             if err:
                 st.warning(f"文件 {file.name} 解析失败: {err}")
                 continue
-            
-            parsed_results.append((df_t, meta, file.name))
-            
+            parsed_results.append((df_t, meta, unique_name))
         except Exception as e:
             st.error(f"处理文件 {file.name} 时出错: {e}")
     
-    if not parsed_results:
-        st.error("没有成功解析任何文件。")
-        st.stop()
+    if not parsed_results: st.error("没有成功解析任何文件。"); st.stop()
         
-    # 合并数据
     if len(parsed_results) == 1:
-        st.success(f"✅ 单文件加载成功: {parsed_results[0][2]}")
+        st.success(f"✅ 单文件: {parsed_results[0][2]}")
         raw_df = parsed_results[0][0]
         feature_meta = parsed_results[0][1]
     else:
-        st.info(f"🔄 正在合并 {len(parsed_results)} 个文件...")
+        st.info(f"🔄 正在合并 {len(parsed_results)} 个文件 (同名代谢物保留最强峰)...")
         merged_df, merged_meta, m_err = merge_multiple_dfs(parsed_results)
-        if m_err:
-            st.error(m_err); st.stop()
-        
+        if m_err: st.error(m_err); st.stop()
         raw_df = merged_df
         feature_meta = merged_meta
-        st.success(f"✅ 合并成功! 总特征数: {raw_df.shape[1]-2}") # 减去 SampleID 和 Group
+        st.success(f"✅ 合并成功! 样本数: {len(raw_df)}")
+
+    # 2. 样本分组信息 (新增)
+    sample_info_file = st.file_uploader("2. 上传样本信息表 (可选)", type=["csv", "xlsx"], help="包含 sample.name 和 group 列，用于覆盖默认分组")
+    
+    if sample_info_file:
+        raw_df, msg = apply_sample_info(raw_df, sample_info_file)
+        if "成功" in msg:
+            st.success(msg)
+        else:
+            st.warning(msg)
 
     # --- 流程控制 ---
     non_num = raw_df.select_dtypes(exclude=[np.number]).columns.tolist()
     if not non_num: st.error("❌ 无法识别分组列"); st.stop()
     
     default_grp_idx = non_num.index('Group') if 'Group' in non_num else 0
-    group_col = st.selectbox("2. 分组列", non_num, index=default_grp_idx)
+    group_col = st.selectbox("3. 分组列", non_num, index=default_grp_idx)
 
     st.divider()
-    st.markdown("### 3. 特征过滤")
+    st.markdown("### 4. 特征过滤")
     filter_option = st.radio("选择特征:", ["全部特征", "仅已注释特征"], index=0)
     
     with st.expander("⚙️ 数据清洗 (高级)", expanded=False):
@@ -177,9 +177,10 @@ with st.sidebar:
         do_log = st.checkbox("Log2 转化", value=True)
         scale_m = st.selectbox("特征缩放", ["None", "Auto", "Pareto"], index=0)
 
+    # --- 组别选择 ---
     all_groups = sorted(raw_df[group_col].astype(str).unique())
     st.divider()
-    st.markdown("### 4. 组别与对比")
+    st.markdown("### 5. 组别与对比")
     selected_groups = st.multiselect("纳入分析的组:", all_groups, default=all_groups[:2] if len(all_groups)>=2 else all_groups)
     if len(selected_groups) < 2: st.error("至少选 2 个组"); st.stop()
     
@@ -189,7 +190,7 @@ with st.sidebar:
     ctrl_grp = c2.selectbox("Ctrl (Ref)", valid_groups, index=1 if len(valid_groups)>1 else 0)
     
     st.divider()
-    st.subheader("5. 绘图参数")
+    st.subheader("6. 绘图参数")
     p_th = st.number_input("P-value 阈值", 0.05, format="%.3f")
     fc_th = st.number_input("Log2 FC 阈值", 1.0)
     enable_jitter = st.checkbox("火山图抖动", value=True)
@@ -202,7 +203,6 @@ df_proc, feats = data_cleaning_pipeline(
     norm_method=norm_m, log_transform=do_log, scale_method=scale_m
 )
 
-# 应用过滤
 if filter_option == "仅已注释特征":
     if feature_meta is not None:
         annotated_feats = feature_meta[feature_meta['Is_Annotated'] == True].index.tolist()
@@ -215,8 +215,6 @@ df_sub = df_proc[df_proc[group_col].isin(selected_groups)].copy()
 if case_grp != ctrl_grp:
     res_stats = run_pairwise_statistics(df_sub, group_col, case_grp, ctrl_grp, feats)
     if feature_meta is not None:
-        # 这里需要注意，合并时可能有重名ID，但因为我们做了唯一化，index应该是唯一的
-        # 使用 left join 保证统计结果行数不变
         res_stats = res_stats.merge(feature_meta[['Confidence_Level', 'Clean_Name']], 
                                     left_on='Metabolite', right_index=True, how='left')
         res_stats['Confidence_Level'] = res_stats['Confidence_Level'].fillna('Unknown')
@@ -284,17 +282,12 @@ with tabs[2]:
     if 'pls_model' in locals():
         vip_scores = calculate_vips(pls_model)
         vip_df = pd.DataFrame({'Metabolite': feats, 'VIP': vip_scores})
-        
-        # 尝试使用 Clean_Name 显示 (如果存在)
         if feature_meta is not None:
              vip_df = vip_df.merge(feature_meta[['Clean_Name']], left_on='Metabolite', right_index=True, how='left')
-             # 如果有 Clean_Name 就用，否则用 ID
              vip_df['Display_Name'] = vip_df['Clean_Name'].fillna(vip_df['Metabolite'])
         else:
              vip_df['Display_Name'] = vip_df['Metabolite']
-
         top_vip = vip_df.sort_values('VIP', ascending=True).tail(25)
-        
         c1, c2, c3 = st.columns([1, 6, 1])
         with c2:
             fig_vip = px.bar(top_vip, x="VIP", y="Display_Name", orientation='h',
@@ -327,12 +320,9 @@ with tabs[3]:
                 x_c, y_c = "Log2_FC_J", "-Log10_P_J"
             
             hover_dict = {"Metabolite":True, "Log2_FC":':.2f', "P_Value":':.2e', 
-                          "Confidence_Level":True, 
-                          x_c:False, y_c:False}
-
+                          "Confidence_Level":True, x_c:False, y_c:False}
             fig_vol = px.scatter(plot_df, x=x_c, y=y_c, color="Sig", color_discrete_map=COLOR_PALETTE,
-                                 hover_data=hover_dict,
-                                 width=600, height=600)
+                                 hover_data=hover_dict, width=600, height=600)
             fig_vol.add_hline(y=-np.log10(p_th), line_dash="dash", line_color="black", opacity=0.8)
             fig_vol.add_vline(x=fc_th, line_dash="dash", line_color="black", opacity=0.8)
             fig_vol.add_vline(x=-fc_th, line_dash="dash", line_color="black", opacity=0.8)
@@ -368,15 +358,12 @@ with tabs[5]:
         st.subheader("统计表")
         if not res_stats.empty:
             display_df = res_stats.sort_values("P_Value").copy()
-            # 优先显示 Clean Name
             if 'Clean_Name' in display_df.columns:
                  display_df['Name'] = display_df['Clean_Name'].fillna(display_df['Metabolite'])
             else:
                  display_df['Name'] = display_df['Metabolite']
-
             cols = ["Name", "Log2_FC", "P_Value", "FDR", "Confidence_Level"]
             cols = [c for c in cols if c in display_df.columns]
-            
             st.dataframe(display_df[cols].style.format({"Log2_FC": "{:.2f}", "P_Value": "{:.2e}", "FDR": "{:.2e}"})
                          .background_gradient(subset=['P_Value'], cmap="Reds_r", vmin=0, vmax=0.05),
                          use_container_width=True, height=600)
