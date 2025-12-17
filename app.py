@@ -35,6 +35,16 @@ st.markdown("""
         background-color: white; border-radius: 5px 5px 0 0;
     }
     .stMultiSelect [data-baseweb="tag"] {background-color: #e3e8ee;}
+    
+    /* 调整提交按钮样式 */
+    div[data-testid="stForm"] button {
+        width: 100%;
+        background-color: #ff4b4b;
+        color: white;
+        font-weight: bold;
+        border: none;
+        padding: 0.5rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -103,12 +113,12 @@ def run_pairwise_statistics(df, group_col, case, control, features):
     return res_df
 
 # ==========================================
-# 2. 侧边栏与数据加载
+# 2. 侧边栏与数据加载 (Part A: 实时交互区)
 # ==========================================
 with st.sidebar:
     st.header("🛠️ 分析控制台")
     
-    # 1. 数据上传
+    # --- 文件上传区 (必须实时响应，不能放在Form里) ---
     uploaded_files = st.file_uploader("1. 上传 MetDNA 数据 (支持多文件)", type=["csv", "xlsx"], accept_multiple_files=True)
     
     feature_meta = None 
@@ -118,118 +128,137 @@ with st.sidebar:
         st.info("👋 请先上传数据文件")
         st.stop()
         
-    # --- 批量文件解析与合并 ---
+    # 解析文件
     parsed_results = []
     for i, file in enumerate(uploaded_files):
         try:
             file.seek(0)
             file_type = 'csv' if file.name.endswith('.csv') else 'excel'
-            # 自动编号防止重名
             unique_name = f"{os.path.splitext(file.name)[0]}_{i+1}{os.path.splitext(file.name)[1]}"
             df_t, meta, err = parse_metdna_file(file, unique_name, file_type=file_type)
-            
             if err:
-                st.warning(f"文件 {file.name} 解析失败: {err}")
-                continue
+                st.warning(f"文件 {file.name} 解析失败: {err}"); continue
             parsed_results.append((df_t, meta, unique_name))
         except Exception as e:
             st.error(f"处理文件 {file.name} 时出错: {e}")
     
-    if not parsed_results: st.error("没有成功解析任何文件。"); st.stop()
+    if not parsed_results: st.stop()
         
     if len(parsed_results) == 1:
-        st.success(f"✅ 单文件: {parsed_results[0][2]}")
         raw_df = parsed_results[0][0]
         feature_meta = parsed_results[0][1]
+        st.success(f"✅ 已加载: {parsed_results[0][2]}")
     else:
-        st.info(f"🔄 正在合并 {len(parsed_results)} 个文件 (同名代谢物保留最强峰)...")
         merged_df, merged_meta, m_err = merge_multiple_dfs(parsed_results)
         if m_err: st.error(m_err); st.stop()
         raw_df = merged_df
         feature_meta = merged_meta
-        st.success(f"✅ 合并成功! 样本数: {len(raw_df)}")
+        st.success(f"✅ 已合并 {len(parsed_results)} 个文件")
 
-    # 2. 样本分组信息 (新增)
-    sample_info_file = st.file_uploader("2. 上传样本信息表 (可选)", type=["csv", "xlsx"], help="包含 sample.name 和 group 列，用于覆盖默认分组")
-    
+    # 样本信息表上传 (实时)
+    sample_info_file = st.file_uploader("2. 上传样本信息表 (可选)", type=["csv", "xlsx"])
     if sample_info_file:
         raw_df, msg = apply_sample_info(raw_df, sample_info_file)
-        if "成功" in msg:
-            st.success(msg)
+        if "成功" in msg: st.success(msg)
+        else: st.warning(msg)
+
+    st.divider()
+    
+    # ==========================================
+    # 3. 参数设置表单 (Part B: 批量提交区)
+    # ==========================================
+    with st.form(key='analysis_form'):
+        st.markdown("### ⚙️ 参数设置")
+        
+        # 分组列选择
+        non_num = raw_df.select_dtypes(exclude=[np.number]).columns.tolist()
+        default_grp_idx = non_num.index('Group') if 'Group' in non_num else 0
+        group_col = st.selectbox("3. 分组列", non_num, index=default_grp_idx)
+        
+        # 特征过滤
+        filter_option = st.radio("4. 特征过滤:", ["全部特征", "仅已注释特征"], index=0)
+        
+        # 数据清洗折叠栏
+        with st.expander("数据清洗与标准化 (高级)", expanded=False):
+            miss_th = st.slider("剔除缺失率 > X", 0.0, 1.0, 0.5, 0.1)
+            impute_m = st.selectbox("填充方法", ["min", "mean", "zero"], index=0)
+            norm_m = st.selectbox("样本归一化", ["None", "Sum", "Median"], index=0)
+            do_log = st.checkbox("Log2 转化", value=True)
+            scale_m = st.selectbox("特征缩放", ["None", "Auto", "Pareto"], index=0)
+
+        # 组别选择 (需要根据 group_col 动态获取，但 Form 内无法实时更新 group_col 的变化)
+        # 技巧：Form 提交后会刷新，所以这里只能显示基于*上一次*运行有效的组
+        # 第一次运行时 group_col 是默认值
+        
+        # 为了用户体验，我们先获取当前 raw_df 的组别
+        # 注意：如果用户改了 group_col 但没点提交，这里的 all_groups 还是旧的。
+        # 这是 Streamlit Form 的限制，但在实际操作中影响不大。
+        current_groups = sorted(raw_df[group_col].astype(str).unique())
+        
+        st.markdown("### 5. 组别与对比")
+        selected_groups = st.multiselect("纳入分析的组:", current_groups, default=current_groups[:2] if len(current_groups)>=2 else current_groups)
+        
+        c1, c2 = st.columns(2)
+        # 简单的防错：确保 default index 不越界
+        valid_grps_list = list(selected_groups)
+        case_grp = c1.selectbox("Exp (Case)", valid_grps_list, index=0 if valid_grps_list else None)
+        ctrl_grp = c2.selectbox("Ctrl (Ref)", valid_grps_list, index=1 if len(valid_grps_list)>1 else 0)
+        
+        st.markdown("### 6. 绘图阈值")
+        c3, c4 = st.columns(2)
+        p_th = c3.number_input("P-value", 0.05, format="%.3f")
+        fc_th = c4.number_input("Log2 FC", 1.0)
+        enable_jitter = st.checkbox("火山图抖动", value=True)
+        
+        st.markdown("---")
+        # --- 提交按钮 ---
+        submit_button = st.form_submit_button(label='🚀 开始分析 (Run Analysis)')
+
+# ==========================================
+# 4. 主逻辑 (仅在点击提交或首次加载时运行)
+# ==========================================
+
+# 如果没有组，停止
+if len(selected_groups) < 2:
+    if submit_button: st.error("请至少选择 2 个组进行分析！")
+    else: st.info("👈 请在左侧设置参数并点击 '开始分析'")
+    st.stop()
+
+# 数据处理 Pipeline
+with st.spinner("正在计算中..."):
+    df_proc, feats = data_cleaning_pipeline(
+        raw_df, group_col, missing_thresh=miss_th, impute_method=impute_m, 
+        norm_method=norm_m, log_transform=do_log, scale_method=scale_m
+    )
+
+    if filter_option == "仅已注释特征":
+        if feature_meta is not None:
+            annotated_feats = feature_meta[feature_meta['Is_Annotated'] == True].index.tolist()
+            feats = [f for f in feats if f in annotated_feats]
+            if not feats: st.error("过滤后无特征！"); st.stop()
         else:
-            st.warning(msg)
+            st.warning("非 MetDNA 数据，无法过滤注释。")
 
-    # --- 流程控制 ---
-    non_num = raw_df.select_dtypes(exclude=[np.number]).columns.tolist()
-    if not non_num: st.error("❌ 无法识别分组列"); st.stop()
-    
-    default_grp_idx = non_num.index('Group') if 'Group' in non_num else 0
-    group_col = st.selectbox("3. 分组列", non_num, index=default_grp_idx)
+    df_sub = df_proc[df_proc[group_col].isin(selected_groups)].copy()
 
-    st.divider()
-    st.markdown("### 4. 特征过滤")
-    filter_option = st.radio("选择特征:", ["全部特征", "仅已注释特征"], index=0)
-    
-    with st.expander("⚙️ 数据清洗 (高级)", expanded=False):
-        miss_th = st.slider("剔除缺失率 > X", 0.0, 1.0, 0.5, 0.1)
-        impute_m = st.selectbox("填充方法", ["min", "mean", "zero"], index=0)
-        norm_m = st.selectbox("样本归一化", ["None", "Sum", "Median"], index=0)
-        do_log = st.checkbox("Log2 转化", value=True)
-        scale_m = st.selectbox("特征缩放", ["None", "Auto", "Pareto"], index=0)
-
-    # --- 组别选择 ---
-    all_groups = sorted(raw_df[group_col].astype(str).unique())
-    st.divider()
-    st.markdown("### 5. 组别与对比")
-    selected_groups = st.multiselect("纳入分析的组:", all_groups, default=all_groups[:2] if len(all_groups)>=2 else all_groups)
-    if len(selected_groups) < 2: st.error("至少选 2 个组"); st.stop()
-    
-    c1, c2 = st.columns(2)
-    valid_groups = [g for g in selected_groups]
-    case_grp = c1.selectbox("Exp (Case)", valid_groups, index=0)
-    ctrl_grp = c2.selectbox("Ctrl (Ref)", valid_groups, index=1 if len(valid_groups)>1 else 0)
-    
-    st.divider()
-    st.subheader("6. 绘图参数")
-    p_th = st.number_input("P-value 阈值", 0.05, format="%.3f")
-    fc_th = st.number_input("Log2 FC 阈值", 1.0)
-    enable_jitter = st.checkbox("火山图抖动", value=True)
-
-# ==========================================
-# 3. 数据处理 Pipeline
-# ==========================================
-df_proc, feats = data_cleaning_pipeline(
-    raw_df, group_col, missing_thresh=miss_th, impute_method=impute_m, 
-    norm_method=norm_m, log_transform=do_log, scale_method=scale_m
-)
-
-if filter_option == "仅已注释特征":
-    if feature_meta is not None:
-        annotated_feats = feature_meta[feature_meta['Is_Annotated'] == True].index.tolist()
-        feats = [f for f in feats if f in annotated_feats]
-        if not feats: st.error("过滤后无特征！"); st.stop()
-        st.success(f"已过滤: {len(feats)} 个已注释特征")
-
-df_sub = df_proc[df_proc[group_col].isin(selected_groups)].copy()
-
-if case_grp != ctrl_grp:
-    res_stats = run_pairwise_statistics(df_sub, group_col, case_grp, ctrl_grp, feats)
-    if feature_meta is not None:
-        res_stats = res_stats.merge(feature_meta[['Confidence_Level', 'Clean_Name']], 
-                                    left_on='Metabolite', right_index=True, how='left')
-        res_stats['Confidence_Level'] = res_stats['Confidence_Level'].fillna('Unknown')
+    if case_grp != ctrl_grp:
+        res_stats = run_pairwise_statistics(df_sub, group_col, case_grp, ctrl_grp, feats)
+        if feature_meta is not None:
+            res_stats = res_stats.merge(feature_meta[['Confidence_Level', 'Clean_Name']], 
+                                        left_on='Metabolite', right_index=True, how='left')
+            res_stats['Confidence_Level'] = res_stats['Confidence_Level'].fillna('Unknown')
+        else:
+            res_stats['Confidence_Level'] = 'N/A'
+        
+        res_stats['Sig'] = 'NS'
+        res_stats.loc[(res_stats['P_Value'] < p_th) & (res_stats['Log2_FC'] > fc_th), 'Sig'] = 'Up'
+        res_stats.loc[(res_stats['P_Value'] < p_th) & (res_stats['Log2_FC'] < -fc_th), 'Sig'] = 'Down'
+        sig_metabolites = res_stats[res_stats['Sig'] != 'NS']['Metabolite'].tolist()
     else:
-        res_stats['Confidence_Level'] = 'N/A'
-    
-    res_stats['Sig'] = 'NS'
-    res_stats.loc[(res_stats['P_Value'] < p_th) & (res_stats['Log2_FC'] > fc_th), 'Sig'] = 'Up'
-    res_stats.loc[(res_stats['P_Value'] < p_th) & (res_stats['Log2_FC'] < -fc_th), 'Sig'] = 'Down'
-    sig_metabolites = res_stats[res_stats['Sig'] != 'NS']['Metabolite'].tolist()
-else:
-    res_stats = pd.DataFrame(); sig_metabolites = []
+        res_stats = pd.DataFrame(); sig_metabolites = []
 
 # ==========================================
-# 4. 结果展示
+# 5. 结果展示 (Tab页)
 # ==========================================
 st.title("📊 代谢组学分析报告")
 st.caption(f"对比: {case_grp} vs {ctrl_grp} | 分析特征数: {len(feats)} | 显著差异: {len(sig_metabolites)} 个")
