@@ -5,9 +5,7 @@ import os
 
 def parse_metdna_file(file_buffer, file_name, file_type='csv'):
     """
-    解析 MetDNA 导出文件 (升级版 v2.0)
-    1. 自动检测样本列 (基于数值类型，不再依赖固定列位置)
-    2. 返回转置后的数据和元数据
+    解析 MetDNA 导出文件 (v3.2 智能去重版)
     """
     # 1. 读取文件
     try:
@@ -18,11 +16,7 @@ def parse_metdna_file(file_buffer, file_name, file_type='csv'):
     except Exception as e:
         return None, None, f"读取失败: {str(e)}"
 
-    # 2. 智能识别样本列 (核心修改)
-    # MetDNA 的元数据列通常包含文字或混合内容，而样本列全是数字
-    # 策略：尝试将每一列转换为数字，如果成功且非空值比例高，则是样本列
-    
-    # 已知的必须排除的元数据列名 (白名单)
+    # 2. 智能识别样本列
     known_meta_cols = [
         'peak_name', 'mz', 'rt', 'id', 'id_zhulab', 'name', 'formula', 
         'confidence_level', 'smiles', 'inchikey', 'isotope', 'adduct', 
@@ -33,55 +27,44 @@ def parse_metdna_file(file_buffer, file_name, file_type='csv'):
     ]
     
     sample_cols = []
-    meta_cols = []
     
     for col in df.columns:
-        if col in known_meta_cols:
-            meta_cols.append(col)
-            continue
-            
-        # 尝试转换为数值
+        if col in known_meta_cols: continue
         try:
-            # coerce会将无法转换的变成NaN
+            # 简单判断：如果是数值列且大部分非空，认为是样本
             numeric_series = pd.to_numeric(df[col], errors='coerce')
-            # 如果非NaN的数据超过 50%，我们认为它是样本数据 (MetDNA 样本列通常是丰度值)
             if numeric_series.notna().mean() > 0.5:
                 sample_cols.append(col)
-            else:
-                meta_cols.append(col)
-        except:
-            meta_cols.append(col)
+        except: pass
             
     if not sample_cols:
-        return None, None, "未找到有效的样本数据列 (数值列)。"
+        return None, None, "未找到样本数据列。"
 
-    # 3. 构建唯一 ID (加入文件名后缀以防多文件合并时重名)
-    # 提取简单的文件名标识 (如 'Pos', 'Neg')
-    file_tag = os.path.splitext(file_name)[0]
-    # 清理文件名，只保留最后一段有意义的，防止名字太长
-    if '_' in file_tag: file_tag = file_tag.split('_')[-1]
+    # 3. 构建元数据
+    # 使用文件名做标签，防止ID重复
+    file_tag = os.path.splitext(os.path.basename(file_name))[0]
+    file_tag = re.sub(r'[^a-zA-Z0-9]', '_', file_tag)
     
     if 'name' not in df.columns: df['name'] = np.nan
     if 'confidence_level' not in df.columns: df['confidence_level'] = 'Unknown'
 
-    meta_list = []
-    
     def process_row(row):
         raw_name = str(row['name']).strip() if pd.notna(row['name']) else ""
         is_annotated = (raw_name != "") and (raw_name.lower() != "nan")
         
         if is_annotated:
-            clean_name = raw_name.split(';')[0]
-            # 关键：在名字后面加上文件标识，防止不同模式下的同名化合物混淆
-            # 例如: Glucose (Pos) vs Glucose (Neg)
+            clean_name = raw_name.split(';')[0] # 纯净名字，用于跨文件比对
+            # ID 必须包含 file_tag 以区分来源
             unique_id = f"{clean_name}_{file_tag}"
         else:
+            # 未注释的用 m/z RT
             unique_id = f"m/z{row['mz']:.4f}_RT{row['rt']:.2f}_{file_tag}"
+            clean_name = unique_id # 未注释的“名字”就是它的ID，确保独一无二
             
         return {
             "Metabolite_ID": unique_id,
             "Original_Name": raw_name,
-            "Clean_Name": clean_name if is_annotated else unique_id,
+            "Clean_Name": clean_name, # 这是“去重”的关键依据
             "Confidence_Level": row.get('confidence_level', 'Unknown'),
             "Is_Annotated": is_annotated,
             "Source_File": file_tag
@@ -90,11 +73,11 @@ def parse_metdna_file(file_buffer, file_name, file_type='csv'):
     meta_info = df.apply(process_row, axis=1)
     meta_df = pd.DataFrame(meta_info.tolist())
     
-    # 再次确保 ID 唯一 (防止同个文件内就有重名)
+    # 确保单文件内 ID 唯一
     meta_df['Metabolite_ID'] = make_unique(meta_df['Metabolite_ID'])
     meta_df.set_index('Metabolite_ID', inplace=True)
     
-    # 4. 构建数据表
+    # 4. 提取数据
     df_data = df[sample_cols].copy()
     df_data.index = meta_df.index
     df_transposed = df_data.T
@@ -103,11 +86,9 @@ def parse_metdna_file(file_buffer, file_name, file_type='csv'):
     df_transposed.reset_index(inplace=True)
     df_transposed.rename(columns={'index': 'SampleID'}, inplace=True)
     
-    # 统一 Group 推断逻辑
     def guess_group(s):
-        s_no_digit = re.sub(r'\d+$', '', str(s))
-        s_clean = s_no_digit.rstrip('._-')
-        return s_clean if s_clean else "Unknown"
+        s_no = re.sub(r'\d+$', '', str(s))
+        return s_no.rstrip('._-') or "Unknown"
 
     df_transposed.insert(1, 'Group', df_transposed['SampleID'].apply(guess_group))
     
@@ -115,45 +96,104 @@ def parse_metdna_file(file_buffer, file_name, file_type='csv'):
 
 def merge_multiple_dfs(results_list):
     """
-    合并多个已解析的数据表
-    results_list: list of (df, meta, filename)
+    合并多文件逻辑 (v2.0): 
+    同名代谢物只保留峰面积最大者 (Max Peak Area Selection)
     """
     if not results_list: return None, None, "无数据"
     
-    # 1. 合并元数据 (Feature Meta)
-    # 直接上下拼接所有文件的元数据
-    all_meta_dfs = [res[1] for res in results_list]
-    merged_meta = pd.concat(all_meta_dfs)
+    # --- 步骤 1: 竞选“最佳代谢物” ---
+    # 字典结构: { Clean_Name: (File_Index, Feature_ID, Max_Intensity) }
+    best_features = {}
     
-    # 2. 合并数据表 (Data Frames)
-    # 我们需要按 SampleID 进行合并 (横向拼接特征)
-    # 基准表: 取第一个文件
-    base_df = results_list[0][0]
+    for file_idx, (df, meta, fname) in enumerate(results_list):
+        # 计算该文件中每个特征的总丰度 (Sum Intensity)
+        # 先排除非数值列 (SampleID, Group)
+        numeric_df = df.select_dtypes(include=[np.number])
+        intensities = numeric_df.sum(axis=0) # 对列求和
+        
+        for feat_id in numeric_df.columns:
+            # 获取该特征的“纯净名”
+            try:
+                clean_name = meta.loc[feat_id, 'Clean_Name']
+                is_annotated = meta.loc[feat_id, 'Is_Annotated']
+            except KeyError:
+                continue # 异常情况跳过
+            
+            # 获取当前强度
+            curr_score = intensities.get(feat_id, 0)
+            
+            # 核心逻辑：
+            # 如果是未注释特征，因为它包含了 RT 和 m/z，通常视作唯一，直接保留(通过将 ID 作为 key)
+            # 如果是已注释特征，使用 Clean_Name 作为 key 进行竞争
+            
+            # 如果尚未记录该代谢物，直接存入
+            if clean_name not in best_features:
+                best_features[clean_name] = (file_idx, feat_id, curr_score)
+            else:
+                # 如果已存在，比较强度
+                prev_idx, prev_id, prev_score = best_features[clean_name]
+                if curr_score > prev_score:
+                    # 当前文件中的这个代谢物更强，替换掉之前的
+                    best_features[clean_name] = (file_idx, feat_id, curr_score)
     
-    for i in range(1, len(results_list)):
-        next_df = results_list[i][0]
+    # --- 步骤 2: 构建过滤后的数据表 ---
+    
+    # 按文件索引整理需要保留的特征 ID
+    # 结构: { file_index: [feat_id_1, feat_id_2...] }
+    files_features_to_keep = {i: [] for i in range(len(results_list))}
+    
+    for c_name, (f_idx, f_id, score) in best_features.items():
+        files_features_to_keep[f_idx].append(f_id)
         
-        # 检查样本ID是否一致
-        # 我们使用 'SampleID' 作为连接键
-        # 注意：如果不同文件里样本顺序不一样，merge 会自动对齐
-        # 但是，必须保证 SampleID 的命名是一模一样的
+    dfs_to_concat = []
+    base_group_series = None
+    
+    for i, (df, meta, fname) in enumerate(results_list):
+        # 准备数据：设 SampleID 为索引
+        if 'SampleID' in df.columns:
+            df = df.set_index('SampleID')
+            
+        # 提取 Group (只取第一个非空文件的)
+        if 'Group' in df.columns:
+            if base_group_series is None:
+                base_group_series = df['Group']
+            df = df.drop(columns=['Group'])
+            
+        # 关键步骤：只保留竞选成功的特征列
+        cols_to_keep = files_features_to_keep[i]
+        # 确保这些列真的在 df 里 (双重保险)
+        valid_cols = [c for c in cols_to_keep if c in df.columns]
         
-        # 为了安全，先移除 Group 列 (避免重复 Group_x, Group_y)，合并后再加回来
-        cols_to_use = [c for c in next_df.columns if c != 'Group']
+        df_filtered = df[valid_cols]
+        dfs_to_concat.append(df_filtered)
         
-        base_df = pd.merge(base_df, next_df[cols_to_use], on='SampleID', how='outer')
+    # --- 步骤 3: 拼接 (Concat) ---
+    try:
+        full_df = pd.concat(dfs_to_concat, axis=1, join='outer')
+    except Exception as e:
+        return None, None, f"合并出错: {str(e)}"
+    
+    full_df.fillna(0, inplace=True)
+    
+    # 恢复 Group
+    if base_group_series is not None:
+        aligned_group = base_group_series.reindex(full_df.index).fillna('Unknown')
+        full_df.insert(0, 'Group', aligned_group)
+    else:
+        full_df.insert(0, 'Group', 'Unknown')
         
-    # 重新整理 Group 列 (如果 outer join 导致某些样本 Group 丢失，尝试恢复)
-    # 这里假设第一个文件的 Group 是准的
-    if 'Group' not in base_df.columns:
-        # 应该不会发生，因为 base_df 保留了 Group
-        pass
-        
-    # 填充因为 outer join 可能产生的 NaN (某个样本在某个文件里没有测到)
-    # 在代谢组学合并中，如果缺失通常意味着未检出，填 0
-    base_df.fillna(0, inplace=True)
-        
-    return base_df, merged_meta, None
+    full_df.reset_index(inplace=True)
+    full_df.rename(columns={'index': 'SampleID'}, inplace=True)
+    
+    # --- 步骤 4: 整理元数据 ---
+    # 找出最终保留的所有 Feature ID
+    final_ids = [fid for f_list in files_features_to_keep.values() for fid in f_list]
+    
+    # 把所有文件的元数据拼起来，然后只保留最终留下的那些
+    all_meta = pd.concat([res[1] for res in results_list])
+    merged_meta = all_meta.loc[final_ids]
+    
+    return full_df, merged_meta, None
 
 def make_unique(series):
     seen = set()
@@ -168,13 +208,12 @@ def make_unique(series):
         result.append(new_item)
     return result
 
-# --- 以下为原有的数据清洗管道 (无需变动) ---
+# --- 清洗管道 (不变) ---
 def data_cleaning_pipeline(df, group_col, missing_thresh=0.5, impute_method='min', 
                            norm_method='None', log_transform=True, scale_method='None'):
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if group_col in numeric_cols: numeric_cols.remove(group_col)
     meta_cols = [c for c in df.columns if c not in numeric_cols]
-    
     data_df = df[numeric_cols].copy()
     meta_df = df[meta_cols].copy()
     
@@ -204,5 +243,4 @@ def data_cleaning_pipeline(df, group_col, missing_thresh=0.5, impute_method='min
 
     var_mask = data_df.var() > 1e-9
     data_df = data_df.loc[:, var_mask]
-    
     return pd.concat([meta_df, data_df], axis=1), data_df.columns.tolist()
